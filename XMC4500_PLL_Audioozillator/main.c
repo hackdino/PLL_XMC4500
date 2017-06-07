@@ -38,7 +38,7 @@
 /******************************************************************** DEFINES */
 #define LED2 P1_0
 #define BUTTON2 P1_15
-
+#define TEST 1
 /******************************************************************** GLOBALS */
 const uint8_t pattern[] = XMC_DAC_PATTERN_SINE;
 
