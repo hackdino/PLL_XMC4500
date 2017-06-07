@@ -11,7 +11,7 @@
 #include <stdint.h>
 /******************************************************************** GLOBALS */
 /******************************************************************** FUNCTION PROTOTYPES */
-void _initUART0_CH0(void);
+void _initUART1_CH1(void);
 uint8_t _uart_send_char(char c);
 uint8_t _uart_printf(char *fmt, ...);
 uint8_t _uart_send_string(char *str);
