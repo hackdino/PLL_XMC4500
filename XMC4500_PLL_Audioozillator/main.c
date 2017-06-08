@@ -33,13 +33,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 
 #include <xmc_gpio.h>
 #include <xmc_dac.h>
 #include <xmc_scu.h>
 #include <xmc_eru.h>
+#include <xmc_ccu4.h>
 
 #include <BSP_uart.h>
+#include "BSP_ccu4.h"
+#include "BSP_dac.h"
 
 /******************************************************************** DEFINES */
 #define LED2 P1_0
@@ -52,27 +56,26 @@
 // UART
 #define RX_BUFFER_SIZE 64
 /******************************************************************** GLOBALS */
-const uint8_t pattern[] = XMC_DAC_PATTERN_SINE;
-
 typedef enum { MULTIPLE = 1, FREQUENCY = 2 } t_pll_action;
 typedef enum { QUARTER = 1, HALF = 2, EQUAL = 3, DOUBLE = 4 } t_pll_factor;
-/******************************************************************** STRUCTURES */
-// DAC config
-XMC_DAC_CH_CONFIG_t const ch_config0=
-{
-  .output_offset  = 0U,
-  .data_type    = XMC_DAC_CH_DATA_TYPE_SIGNED,
-  .output_scale   = XMC_DAC_CH_OUTPUT_SCALE_MUL_64,
-  .output_negation = XMC_DAC_CH_OUTPUT_NEGATION_DISABLED,
-};
 
-XMC_DAC_CH_CONFIG_t const ch_config1=
-{
-  .output_offset  = 0U,
-  .data_type    = XMC_DAC_CH_DATA_TYPE_SIGNED,
-  .output_scale   = XMC_DAC_CH_OUTPUT_SCALE_NONE,
-  .output_negation = XMC_DAC_CH_OUTPUT_NEGATION_DISABLED,
-};
+/* Timer Interrupt counters */
+volatile uint32_t g_num_period_interrupts;
+volatile bool period_match;
+
+/* PLL program variables */
+volatile bool IsPllRequest;
+volatile bool IsPllRunning;
+volatile bool IsTimerRunning;
+
+t_pll_action CurrentPllAction;
+t_pll_factor CurrentPllFactor;
+uint32_t CurrentPllFrequency;
+
+double g_timer_period_duration = 0.00001; // 10 us ??
+double g_currentInputSignalDuration;
+double g_currentInputSignalFrequency;
+/******************************************************************** STRUCTURES */
 
 // ERU config
 XMC_ERU_ETL_CONFIG_t button_event_generator_config =
@@ -91,11 +94,7 @@ XMC_ERU_OGU_CONFIG_t button_event_detection_config =
 };
 
 /******************************************************************** PROTOTYPES */
-void setPLLFactor(uint8_t factor);
-void setPLLFrequency(uint32_t frequency);
-void _initDAC0(void);
-void _dac_set_value(const uint8_t channel, const uint16_t dacVal);
-uint8_t _dac_set_pattern(const uint8_t channel, const uint32_t freq);
+void initPLL();
 void error_message_led(void);
 
 /******************************************************************** INTERRUPTS */
@@ -108,14 +107,45 @@ void ERU1_0_IRQHandler(void)
   /*
    * - receive PLL request from UART
    * - on rising edge start a ccu4 timer
-   * - on next rising edge stop the timer and save the timer period
+   * - on next rising edge stop the timer and save the duration
    * -- start the DAC with the requested frequency
    */
 
-//  if (IsPllRequest)
-//  {
-//
-//  }
+  if (IsPllRequest)
+  {
+    if (!IsTimerRunning)
+    {
+      g_num_period_interrupts = 0;
+      _ccu4_start_timer();
+    }
+    else
+    {
+      _ccu4_stop_timer();
+
+      initPLL();
+
+      IsPllRequest = false;
+    }
+  }
+  else if (IsPllRunning)
+  {
+    // TODO: PLL Regler Code... adjust current pll output signal
+
+    // Idee: output pll signal mit ADC messen (mind. 3 werte),
+    // abweichung prüfen (mit 3 werten kann bestimmt werden ob steigende oder fallende,
+    // somit auch ob zu früh oder zu spät)
+    // dann einen 2. timer starten der entweder etwas länger oder kürzer ist also eingangssignal
+    // im timer interrupt pll dac neu starten um die zeitverzögerung auszugleichen
+    // diese schritte immer wieder wiederholen = REGLER
+  }
+}
+
+/* Interrupt handlers */
+void CCU40_0_IRQHandler(void)
+{
+  g_num_period_interrupts++;
+  XMC_CCU4_SLICE_ClearEvent(SLICE_PTR, XMC_CCU4_SLICE_IRQ_ID_PERIOD_MATCH);
+  period_match = true;
 }
 
 /******************************************************************** MAIN */
@@ -133,6 +163,7 @@ int main(void)
 
   _initDAC0();
   _initUART1_CH1();
+  _initCCU40_0();
 
 
   /* Available UART functions */
@@ -209,22 +240,22 @@ int main(void)
       else if (rx_buff[1] == '3') // PLL command
       {
         uint8_t pllAction = strtol(&rx_buff[3], (char **)NULL, 10);
-        t_pll_action action = pllAction;
-        if (action == MULTIPLE)
+        CurrentPllAction = pllAction;
+
+        if (CurrentPllAction == MULTIPLE)
         {
           uint8_t pllFactor = strtol(&rx_buff[3], (char **)NULL, 10);
-          t_pll_factor factor = pllFactor;
-
-          setPLLFactor(factor);
+          CurrentPllFactor = pllFactor;
         }
-        else if (action == FREQUENCY)
+        else if (CurrentPllAction == FREQUENCY)
         {
           uint32_t pllFrequency = strtol(&rx_buff[3], (char **)NULL, 10);
 
           // check min, max values?
-
-          setPLLFrequency(pllFrequency);
+          CurrentPllFrequency = pllFrequency;
         }
+
+        IsPllRequest = true;
       }
     }
 
@@ -237,63 +268,40 @@ int main(void)
 
 
 /******************************************************************** FUNCTIONS */
-void setPLLFactor(uint8_t factor)
+void initPLL()
 {
-  // TODO:
-  if (factor == HALF)
+  // calculate duration [s]
+  g_currentInputSignalDuration = g_num_period_interrupts * g_timer_period_duration;
+
+  // Frequenz [Hz]
+  g_currentInputSignalFrequency = 1 / g_currentInputSignalDuration;
+
+  if (CurrentPllAction == MULTIPLE)
   {
-
+    if (CurrentPllFactor == HALF)
+    {
+      // NOTE: resulting frequ = frequency * XMC_DAC_SAMPLES_PER_PERIOD
+      // XMC_DAC_SAMPLES_PER_PERIOD = 32U
+      uint32_t freq = g_currentInputSignalFrequency / 2;
+      _dac_start_pattern_mode(0U, freq);
+    }
+    else if (CurrentPllFactor == DOUBLE)
+    {
+      uint32_t freq = g_currentInputSignalFrequency * 2;
+      _dac_start_pattern_mode(0U, freq);
+    }
   }
-  else if (factor == DOUBLE)
+  else if (CurrentPllAction == FREQUENCY)
   {
-
+    _dac_start_pattern_mode(0U, CurrentPllFrequency);
   }
 
+  IsPllRunning = true;
 }
 
-void setPLLFrequency(uint32_t frequency)
-{
-  // TODO:
-
-}
-
-void _initDAC0(void)
-{
-
-  /* API to initial DAC Module*/
-  //XMC_DAC_CH_Init(XMC_DAC0, 0U, &ch_config0);
-  XMC_DAC_CH_Init(XMC_DAC0, 1U, &ch_config1);
-
-  /* API to initial DAC in Pattern mode. When using a predefined pattern a type cast avoid warnings */
-  //XMC_DAC_CH_StartPatternMode(XMC_DAC0, 0U, pattern, XMC_DAC_CH_PATTERN_SIGN_OUTPUT_DISABLED, XMC_DAC_CH_TRIGGER_INTERNAL, 500U);
-
-  /* API to initial DAC in SingleValue mode */
-  XMC_DAC_CH_StartSingleValueMode(XMC_DAC0, 1U);
-
-}
-
-void _dac_set_value(const uint8_t channel, const uint16_t dacVal)
-{
-  /* API to write a value into DAC Output */
-  XMC_DAC_CH_Write(XMC_DAC0, channel, dacVal);
-
-  return;
-}
-
-uint8_t _dac_set_pattern(const uint8_t channel, const uint32_t freq)
-{
-  /* update frequency */
-  XMC_DAC_CH_STATUS_t ret = XMC_DAC_CH_SetPatternFrequency(XMC_DAC0, channel, freq);
-
-  if (ret == XMC_DAC_CH_STATUS_OK)
-    return 0;
-
-  return ret;
-}
 
 void error_message_led(void)
 {
-
     PORT1->IOCR0 = 0x80;    //Set the port P1.0 to output
     PORT1->OUT = 1;     //Set the output signal to port P1.0
 }
