@@ -1,36 +1,4 @@
-/*
- * Copyright (C) 2015 Infineon Technologies AG. All rights reserved.
- *
- * Infineon Technologies AG (Infineon) is supplying this software for use with
- * Infineon's microcontrollers.
- * This file can be freely distributed within development tools that are
- * supporting such microcontrollers.
- *
- * THIS SOFTWARE IS PROVIDED "AS IS". NO WARRANTIES, WHETHER EXPRESS, IMPLIED
- * OR STATUTORY, INCLUDING, BUT NOT LIMITED TO, IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE APPLY TO THIS SOFTWARE.
- * INFINEON SHALL NOT, IN ANY CIRCUMSTANCES, BE LIABLE FOR SPECIAL, INCIDENTAL,
- * OR CONSEQUENTIAL DAMAGES, FOR ANY REASON WHATSOEVER.
- *
- */
-
 /**
- * @file
- * @date 04 Dec, 2014
- * @version 1.0.0
- *
- * @brief XMC4500 CPU board VADC measurement example
- *
- * This is an example depicting usage of the ADC driver.
- * The ADC driver is used to configure various functional blocks of the
- * peripheral, setting up of a single entry queue and converting the lone
- * entry by means of a software generated queue conversion request periodically
- * in the SysTick handler. The SysTick timer is configured to fire every 10ms.
- * The results are send via UART and can be visualize in a PC using a terminal program
- *
- * History <br>
- *
- * Version 1.0.0 Initial <br>
  *
  */
 
