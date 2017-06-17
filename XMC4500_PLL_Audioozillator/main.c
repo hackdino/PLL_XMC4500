@@ -10,7 +10,8 @@
 #include <xmc_dac.h>
 #include <xmc_gpio.h>
 #include <xmc_ccu4.h>
-
+#include <math.h>
+#include <stdlib.h>
 /*********************************************************************************************************************
  * MACROS
  ********************************************************************************************************************/
@@ -27,6 +28,8 @@
 #define IN_ZERO P2_10
 #define TRIGGER_DAC P3_0
 #define OUT_ZERO P3_2
+#define PHASE_DIFF P0_0
+#define DIR_CORR P1_14
 
 /*********************************************************************************************************************
  * GLOBAL DATA
@@ -127,6 +130,11 @@ const XMC_VADC_BACKGROUND_CONFIG_t g_bgn_handle = { };
 #define MODULE_NUMBER_2     (0U)
 #define SLICE_NUMBER_2      (0U)
 
+#define SLICE_PTR_3       	CCU42_CC40
+#define MODULE_PTR_3        CCU42
+#define MODULE_NUMBER_3     (0U)
+#define SLICE_NUMBER_3      (0U)
+
 
 XMC_CCU4_SLICE_COMPARE_CONFIG_t g_timer_object_1 =
 {
@@ -160,10 +168,34 @@ XMC_CCU4_SLICE_COMPARE_CONFIG_t g_timer_object_2 =
 		.timer_concatenation = 0U
 };
 
+XMC_CCU4_SLICE_COMPARE_CONFIG_t g_timer_object_3 =
+{
+		.timer_mode 		     = XMC_CCU4_SLICE_TIMER_COUNT_MODE_EA,
+		.monoshot   		     = false,
+		.shadow_xfer_clear   = 0U,
+		.dither_timer_period = 0U,
+		.dither_duty_cycle   = 0U,
+		.prescaler_mode	     = XMC_CCU4_SLICE_PRESCALER_MODE_NORMAL,
+		.mcm_enable		       = 0U,
+		.prescaler_initval   = 3U,
+		.float_limit		     = 0U,
+		.dither_limit		     = 0U,
+		.passive_level 	     = XMC_CCU4_SLICE_OUTPUT_PASSIVE_LEVEL_LOW,
+		.timer_concatenation = 0U
+};
 
-#define FAKTOR_DIV 0.5
+
+#define FAKTOR_DIV 4
 
 
+volatile static bool out_signal = false;
+volatile static bool in_signal = false;
+volatile uint16_t correct_fact=0;
+volatile uint16_t old_phase_diff= 0;
+volatile static bool dir = false;
+volatile static bool not_regel = false;
+
+#define REGELUNG
 
 /*********************************************************************************************************************
  * ISR Handler
@@ -180,12 +212,25 @@ void VADC0_G0_0_IRQHandler(void)
 	}
 	static uint16_t i=0;
 
-	if(i<2000){
-		array[i++]= input_freq;
-	}
 	uint16_t period = (uint16_t)((input_freq/16)/FAKTOR_DIV);
+	if(i<2000){
+		array[i++]= period;
+	}else{
+		i=0;
+	}
 
+#ifdef REGELUNG
+	uint16_t steps = (uint16_t)(correct_fact/10);
+	if(dir == true){
+		XMC_CCU4_SLICE_SetTimerPeriodMatch(SLICE_PTR_2, period+steps);
+	}else{
+		XMC_CCU4_SLICE_SetTimerPeriodMatch(SLICE_PTR_2, period-steps);
+	}
+#else
 	XMC_CCU4_SLICE_SetTimerPeriodMatch(SLICE_PTR_2, period);
+#endif
+
+	//correct_fact = 0;
 	/* Enable shadow transfer */
 	XMC_CCU4_EnableShadowTransfer(MODULE_PTR_2, XMC_CCU4_SHADOW_TRANSFER_SLICE_0);
 
@@ -195,18 +240,25 @@ void VADC0_G0_0_IRQHandler(void)
 
 
 	XMC_GPIO_ToggleOutput(IN_ZERO);
+	in_signal = !in_signal;
 }
 
+/**
+ * Timer IST to trigger DAC pattern
+ */
 void CCU41_0_IRQHandler(void)
 {
 	static int i = 0;
 
-	if(i<32){
+	if(i<((16*FAKTOR_DIV)-1)){
 		i++;
 	}else{
 		i=0;
 		XMC_GPIO_ToggleOutput(OUT_ZERO);
+		out_signal = !out_signal;
 	}
+
+
 	XMC_DAC_CH_SoftwareTrigger(XMC_DAC0, 0);
 	XMC_GPIO_ToggleOutput(TRIGGER_DAC);
 }
@@ -267,13 +319,6 @@ static void init_adc_zero_in(void){
 }
 
 /**
- * Initialize zerocross detection for Output signal
- */
-static void init_adc_zero_out(void){
-
-}
-
-/**
  * Initialize Timer for detect Input frequency
  */
 static void init_timer_detect_freq(void){
@@ -293,6 +338,29 @@ static void init_timer_detect_freq(void){
 	/* Enable shadow transfer */
 	XMC_CCU4_EnableShadowTransfer(MODULE_PTR_1, XMC_CCU4_SHADOW_TRANSFER_SLICE_0);
 	XMC_CCU4_SLICE_StartTimer(SLICE_PTR_1);
+
+}
+
+/**
+ * Initialize Timer for detect phase difference
+ */
+static void init_timer_detect_phase_diff(void){
+
+	/* Timer configuration */
+	/* Ensure fCCU reaches CCU42 */
+	XMC_CCU4_SetModuleClock(MODULE_PTR_3, XMC_CCU4_CLOCK_SCU);
+	XMC_CCU4_Init(MODULE_PTR_3, XMC_CCU4_SLICE_MCMS_ACTION_TRANSFER_PR_CR);
+	/* Get the slice out of idle mode */
+	XMC_CCU4_EnableClock(MODULE_PTR_3, SLICE_NUMBER_3);
+	/* Start the prescaler and restore clocks to slices */
+	//XMC_CCU4_SLICE_SetPrescaler(SLICE_PTR, 7);
+	XMC_CCU4_StartPrescaler(MODULE_PTR_3);
+	/* Initialize the Slice */
+	XMC_CCU4_SLICE_CompareInit(SLICE_PTR_3, &g_timer_object_3);
+	XMC_CCU4_SLICE_SetTimerPeriodMatch(SLICE_PTR_3, 65000U);
+	/* Enable shadow transfer */
+	XMC_CCU4_EnableShadowTransfer(MODULE_PTR_3, XMC_CCU4_SHADOW_TRANSFER_SLICE_0);
+	XMC_CCU4_SLICE_StartTimer(SLICE_PTR_3);
 
 }
 
@@ -340,6 +408,8 @@ static void init_gpio(void){
 	XMC_GPIO_Init(IN_ZERO, &config);
 	XMC_GPIO_Init(TRIGGER_DAC, &config);
 	XMC_GPIO_Init(OUT_ZERO, &config);
+	XMC_GPIO_Init(PHASE_DIFF, &config);
+	XMC_GPIO_Init(DIR_CORR, &config);
 }
 
 /*********************************************************************************************************************
@@ -352,11 +422,13 @@ int main(void)
 	/* Initialize GPIO */
 	init_gpio();
 
-
+	/* Initialize timer to detect input frequency */
 	init_timer_detect_freq();
 
 	/* Initialize Timer to generate Output frequency */
 	init_timer_generate_out_freq();
+
+	init_timer_detect_phase_diff();
 
 	/* Initialize Zerocross detection Input */
 	init_adc_zero_in();
@@ -367,11 +439,29 @@ int main(void)
 	/* System timer configuration */
 	//SysTick_Config(SystemCoreClock / TICKS_PER_SECOND);
 
+	bool help_flag = false;
 
 	while(1){
-
-
-
+		/* detect phase difference */
+		if(!out_signal != !in_signal){
+			if(help_flag == false){
+				help_flag = true;
+				XMC_GPIO_SetOutputHigh(PHASE_DIFF);
+				XMC_CCU4_SLICE_StopClearTimer(SLICE_PTR_3);
+				XMC_CCU4_SLICE_StartTimer(SLICE_PTR_3);
+			}
+		}else{
+			if(help_flag == true){
+				XMC_GPIO_SetOutputLow(PHASE_DIFF);
+				correct_fact = XMC_CCU4_SLICE_GetTimerValue(SLICE_PTR_3);
+				help_flag = false;
+				if(correct_fact > old_phase_diff){
+					dir = !dir;
+					XMC_GPIO_ToggleOutput(DIR_CORR);
+				}
+				old_phase_diff = correct_fact;
+			}
+		}
 	}
 }
 
