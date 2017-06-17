@@ -10,8 +10,11 @@
 #include <xmc_dac.h>
 #include <xmc_gpio.h>
 #include <xmc_ccu4.h>
+#include <xmc_uart.h>
 #include <math.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
 /*********************************************************************************************************************
  * MACROS
  ********************************************************************************************************************/
@@ -28,8 +31,8 @@
 #define IN_ZERO P2_10
 #define TRIGGER_DAC P3_0
 #define OUT_ZERO P3_2
-#define PHASE_DIFF P0_0
-#define DIR_CORR P1_14
+#define PHASE_DIFF P14_12
+#define DIR_CORR P14_14
 
 /*********************************************************************************************************************
  * GLOBAL DATA
@@ -39,29 +42,43 @@
 #define ARRAY_SIZE 	     (48U)
 #define TICKS_PER_SECOND (10U)
 
+/* -------------------------------------- UART settings */
+// U1C1
+#define UART_TX P0_1
+#define UART_RX P0_0
 
-const uint16_t melody[ARRAY_SIZE] =
+#define RX_FIFO_INITIAL_LIMIT 1
+#define TX_FIFO_INITIAL_LIMIT 1
+
+#define BUFFER_SIZE_PRINTF 255
+#define BUFFER_SIZE_RX 64
+#define STRING_LF 10
+#define RX_BUFFER_SIZE 64
+
+_Bool uart_str_available = false;
+char uart_rx_buffer[BUFFER_SIZE_RX] = {0};
+
+
+XMC_GPIO_CONFIG_t uart_tx =
 {
-		660U,	R,	660U,	R, 	660U,	R, 	510U,	R,
-		660U, R, 	770U,	R,	380U,	R, 	510U,	R,
-		380U,	R, 	320U,	R, 	440U,	R, 	480U,   R,
-		450U,	R,	430U,	R,	380U,	R,	660U,	R,
-		760U,	R,	860U,	R,	700U,   R, 	760U,	R,
-		660U, R,	520U,	R,	580U,	R,	480U,	R
+    .mode = XMC_GPIO_MODE_OUTPUT_PUSH_PULL_ALT2,
+    .output_strength = XMC_GPIO_OUTPUT_STRENGTH_MEDIUM
+};
+
+XMC_GPIO_CONFIG_t uart_rx =
+{
+    .mode = XMC_GPIO_MODE_INPUT_TRISTATE
+};
+
+XMC_UART_CH_CONFIG_t uart_config =
+{
+    .data_bits = 8U,
+    .stop_bits = 1U,
+    .baudrate = 9600U
 };
 
 
-const uint16_t beats[ARRAY_SIZE] =
-{
-		10U, 15U, 10U, 30U, 10U, 30U,	10U, 10U,
-		10U, 30U, 10U, 55U, 10U, 57U, 10U, 45U,
-		10U, 40U,	10U, 50U, 10U, 30U,	 8U, 33U,
-		10U, 15U,	10U, 30U, 10U, 20U,	 8U, 20U,
-		5U,  15U,	10U, 30U,  8U, 15U,	 5U, 35U,
-		8U,  30U,	 8U, 15U,  8U, 15U,	 8U, 50U
-};
-
-
+/* ------------------------------- DAC settings */
 XMC_DAC_CH_CONFIG_t const ch_config0=
 {
 		.output_offset	= 0U,
@@ -184,40 +201,60 @@ XMC_CCU4_SLICE_COMPARE_CONFIG_t g_timer_object_3 =
 		.timer_concatenation = 0U
 };
 
-
-#define FAKTOR_DIV 4
-
+/* PLL Faktor */
+static uint8_t pll_faktor_div = 1;
+static uint8_t pll_current_input_frequency = 0;
 
 volatile static bool out_signal = false;
 volatile static bool in_signal = false;
 volatile uint16_t correct_fact=0;
 volatile uint16_t old_phase_diff= 0;
 volatile static bool dir = false;
-volatile static bool not_regel = false;
 
 #define REGELUNG
 
 /*********************************************************************************************************************
  * ISR Handler
  ********************************************************************************************************************/
+
+void USIC1_0_IRQHandler(void) {
+  static uint8_t rx_ctr = 0;
+  uint16_t rx_tmp = 0;
+
+  /* Read the RX FIFO till it is empty */
+  while(!XMC_USIC_CH_RXFIFO_IsEmpty(XMC_UART1_CH1)) {
+    rx_tmp = XMC_UART_CH_GetReceivedData(XMC_UART1_CH1);
+
+    if((rx_tmp != STRING_LF) && (!uart_str_available)) {
+      uart_rx_buffer[rx_ctr++] = rx_tmp;
+    } else {
+      rx_ctr = 0;
+      uart_str_available = true;
+    }
+  }
+}
+
+
 volatile uint16_t array[2000] = {0};
 /**
  * Zerocroos detection for Input signal
  */
 void VADC0_G0_0_IRQHandler(void)
 {
-	uint16_t input_freq= XMC_CCU4_SLICE_GetTimerValue(SLICE_PTR_1);
+	uint16_t input_freq = XMC_CCU4_SLICE_GetTimerValue(SLICE_PTR_1);
 	if(input_freq < 1000){
 		return;
 	}
 	static uint16_t i=0;
 
-	uint16_t period = (uint16_t)((input_freq/16)/FAKTOR_DIV);
+	uint16_t period = (uint16_t)((input_freq/16)/pll_faktor_div);
 	if(i<2000){
 		array[i++]= period;
 	}else{
 		i=0;
 	}
+
+	pll_current_input_frequency = period;
 
 #ifdef REGELUNG
 	uint16_t steps = (uint16_t)(correct_fact/10);
@@ -250,14 +287,13 @@ void CCU41_0_IRQHandler(void)
 {
 	static int i = 0;
 
-	if(i<((16*FAKTOR_DIV)-1)){
+	if(i<((16*pll_faktor_div)-1)){
 		i++;
 	}else{
 		i=0;
 		XMC_GPIO_ToggleOutput(OUT_ZERO);
 		out_signal = !out_signal;
 	}
-
 
 	XMC_DAC_CH_SoftwareTrigger(XMC_DAC0, 0);
 	XMC_GPIO_ToggleOutput(TRIGGER_DAC);
@@ -412,6 +448,55 @@ static void init_gpio(void){
 	XMC_GPIO_Init(DIR_CORR, &config);
 }
 
+
+static void initUART1_CH1() {
+  /* USIC channels initialization */
+  XMC_UART_CH_Init(XMC_UART1_CH1, &uart_config);
+
+  XMC_UART_CH_SetInputSource(XMC_UART1_CH1, XMC_UART_CH_INPUT_RXD, USIC1_C1_DX0_P0_0);
+
+  /* FIFOs initialization for both channels:
+   *  8 entries for TxFIFO from point 0, LIMIT=1
+   *  8 entries for RxFIFO from point 8, LIMIT=7 (SRBI is set if all 8*data has been received)
+   *  */
+  XMC_USIC_CH_TXFIFO_Configure(XMC_UART1_CH1, 0, XMC_USIC_CH_FIFO_SIZE_8WORDS, TX_FIFO_INITIAL_LIMIT);
+  XMC_USIC_CH_RXFIFO_Configure(XMC_UART1_CH1, 8, XMC_USIC_CH_FIFO_SIZE_8WORDS, RX_FIFO_INITIAL_LIMIT);
+
+  /* Enabling events for TX FIFO and RX FIFO */
+  XMC_USIC_CH_RXFIFO_EnableEvent(XMC_UART1_CH1, XMC_USIC_CH_RXFIFO_EVENT_CONF_STANDARD |
+      XMC_USIC_CH_RXFIFO_EVENT_CONF_ALTERNATE);
+
+  /* Connecting the previously enabled events to a Service Request line number */
+  XMC_USIC_CH_RXFIFO_SetInterruptNodePointer(XMC_UART1_CH1,XMC_USIC_CH_RXFIFO_INTERRUPT_NODE_POINTER_STANDARD,0);
+  XMC_USIC_CH_RXFIFO_SetInterruptNodePointer(XMC_UART1_CH1,XMC_USIC_CH_RXFIFO_INTERRUPT_NODE_POINTER_ALTERNATE,0);
+
+  /* Start USIC operation as UART */
+  XMC_UART_CH_Start(XMC_UART1_CH1);
+
+  /*Initialization of the necessary ports*/
+  XMC_GPIO_Init(UART_TX, &uart_tx);
+  XMC_GPIO_Init(UART_RX, &uart_rx);
+
+  /*Configuring priority and enabling NVIC IRQ for the defined Service Request line number */
+  NVIC_SetPriority(USIC1_0_IRQn,62U);
+  NVIC_EnableIRQ(USIC1_0_IRQn);
+
+  return;
+}
+
+static uint8_t uart_send_string(char *str) {
+  if(str == NULL) {
+    return 1;
+  }
+
+  for(int i=0;i<strlen(str);i++) {
+    while(XMC_USIC_CH_GetTransmitBufferStatus(XMC_UART1_CH1) == XMC_USIC_CH_TBUF_STATUS_BUSY);
+    XMC_UART_CH_Transmit(XMC_UART1_CH1, str[i]);
+  }
+
+  return 0;
+}
+
 /*********************************************************************************************************************
  * Main Application
  ********************************************************************************************************************/
@@ -421,6 +506,9 @@ int main(void)
 {
 	/* Initialize GPIO */
 	init_gpio();
+
+	/* Initialize UART1_1 */
+	initUART1_CH1();
 
 	/* Initialize timer to detect input frequency */
 	init_timer_detect_freq();
@@ -440,8 +528,33 @@ int main(void)
 	//SysTick_Config(SystemCoreClock / TICKS_PER_SECOND);
 
 	bool help_flag = false;
+	char rx_buff[RX_BUFFER_SIZE] = {0};
 
 	while(1){
+
+	  if (uart_str_available)
+	  {
+	    memcpy(rx_buff, &uart_rx_buffer, strlen(uart_rx_buffer));
+	    memset(&uart_rx_buffer, 0x00, BUFFER_SIZE_RX);
+
+	    if (rx_buff[0] == '#' && rx_buff[1] == '1' && rx_buff[2] == ';')
+	    {
+        // UART Msg example:
+        // Multiple:  #1;[2|4|8]
+	      pll_faktor_div = strtol(&rx_buff[3], (char **)NULL, 10);
+	    }
+
+	    uart_str_available = false;
+	    memset(rx_buff, '\0', strlen(rx_buff));
+
+	    // send current input signal frequency?
+	    char tx_buff[100];
+
+	    sprintf(tx_buff, "PLL: current input frequency %d - set PLL factor %d",
+	        pll_current_input_frequency, pll_faktor_div);
+	    uart_send_string(tx_buff);
+	  }
+
 		/* detect phase difference */
 		if(!out_signal != !in_signal){
 			if(help_flag == false){
